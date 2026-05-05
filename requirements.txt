@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+aiortc
+torch
+transformers>=4.34.0
+soundfile
+numpy
+accelerate
+redis
+librosa
