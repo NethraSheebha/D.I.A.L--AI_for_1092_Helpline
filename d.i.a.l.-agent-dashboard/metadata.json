@@ -1,0 +1,6 @@
+{
+  "name": "D.I.A.L. Agent Dashboard",
+  "description": "Dialect-aware Intent-verified Assist Line. A high-performance dashboard for government helpline agents featuring real-time dialect detection, intent verification, and confidence monitoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

@@ -4,3 +4,14 @@ __pycache__/
 venv/
 .vscode/
 *.py[cod]
+
+# from d.i.a.l.-agent-dashboard
+d.i.a.l.-agent-dashboard/node_modules/
+d.i.a.l.-agent-dashboard/build/
+d.i.a.l.-agent-dashboard/dist/
+d.i.a.l.-agent-dashboard/coverage/
+d.i.a.l.-agent-dashboard/.DS_Store
+d.i.a.l.-agent-dashboard/*.log
+d.i.a.l.-agent-dashboard/.env*
+!d.i.a.l.-agent-dashboard/.env.example
+
