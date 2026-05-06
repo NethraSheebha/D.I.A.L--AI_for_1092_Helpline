@@ -8,6 +8,32 @@ from typing import Dict, Generator, List, Optional
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from fastapi import APIRouter, WebSocket
+from modules.stt import IndicConformerSTT
+from modules.tts import IndicParlerTTS
+
+router = APIRouter()
+
+# Initialize STT and TTS models
+stt_model = IndicConformerSTT()
+tts_model = IndicParlerTTS()
+
+@router.websocket("/stream")
+async def stream_audio(websocket: WebSocket):
+    """WebSocket endpoint for streaming audio to STT and receiving TTS responses."""
+    await websocket.accept()
+    try:
+        while True:
+            audio_chunk = await websocket.receive_bytes()
+            transcript = stt_model.append_pcm(audio_chunk)
+
+            if transcript:
+                # Send transcript to TTS for synthesis
+                audio_response = tts_model.synthesize(transcript)
+                await websocket.send_bytes(audio_response)
+    except Exception as e:
+        await websocket.close()
+        print(f"[WebSocket Error]: {e}")
 
 
 def _escalation_generator():
@@ -69,7 +95,7 @@ class Gemma4Agent:
                 "input_ids": input_ids,
                 "max_new_tokens": self.max_new_tokens,
                 "temperature": 0.7,
-                "do_sample": False,
+                "do_sample": True,
                 "streamer": streamer,
             },
         )

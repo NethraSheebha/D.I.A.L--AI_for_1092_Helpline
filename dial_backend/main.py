@@ -23,7 +23,7 @@ from modules.stt import IndicConformerSTT, initialize_stt
 from modules.acoustic_analytics import AcousticAnalytics
 from modules.nlu import IndicBERTIntentExtractor, IndicTrans2Translator, DialectFingerprinter
 from modules.sentiment import PyannoteAcousticSentiment
-from modules.tts import CoquiTTS
+from modules.tts import IndicParlerTTS, initialize_tts
 from modules.confidence import ConfidenceScorer
 import modules.store as store
 
@@ -199,12 +199,11 @@ async def lifespan(app: FastAPI):
         dialect_fp = None
     
     try:
-        tts = CoquiTTS(model_name=os.getenv("TTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2"))
-        await tts.initialize()
-        logger.info("✅ TTS model loaded")
+        await initialize_tts()
+        logger.info("✅ TTS model initialized (Pipeline warmed up)")
     except Exception as e:
         logger.error(f"❌ TTS initialization failed: {str(e)[:100]}")
-        tts = None
+
     
     try:
         confidence_scorer = ConfidenceScorer()
@@ -308,9 +307,8 @@ async def health_check_full():
         },
         "stt": {
             "status": "ready" if initialize_stt is not None else "not_loaded",
-            "model": "FastWhisper",
-            "model_size": os.getenv("WHISPER_MODEL_SIZE", "medium"),
-            "device": os.getenv("WHISPER_DEVICE", "cpu")
+            "model": "ai4bharat/indic-conformer-600m-multilingual",
+            "device": "cpu"
         },
         "nlu_intent": {
             "status": "ready" if nlu_intent is not None else "not_loaded",
@@ -321,9 +319,9 @@ async def health_check_full():
             "model": "PyannoteAcoustic" if sentiment else None
         },
         "tts": {
-            "status": "ready" if tts is not None else "not_loaded",
-            "model": "Edge-TTS" if tts else None,
-            "model_name": "azure-neural-voices" if tts else None
+            "status": "ready" if initialize_tts is not None else "not_loaded",
+            "model_name": "ai4bharat/indic-parler-tts",
+            "device": "cpu"
         },
         "confidence": {
             "status": "ready" if confidence_scorer is not None else "not_loaded",
@@ -403,7 +401,7 @@ async def call_ws(websocket: WebSocket):
     logger.info(f"[{call_id}] New WebSocket connection established")
     
     # Initialize per-session engines
-    stt_engine = IndicConformerSTT(device=os.getenv("STT_DEVICE", "cpu"))
+    stt_engine = IndicConformerSTT(device="cpu")
     analytics_engine = AcousticAnalytics()
     
     audio_buffer = bytearray()
@@ -512,6 +510,7 @@ async def call_ws(websocket: WebSocket):
 async def process_turn(websocket: WebSocket, session: dict, transcript_text: str, audio_bytes: bytes):
     session["turn_number"] += 1
     logger.info(f"[{session['call_id']}] Processing turn {session['turn_number']} with transcript: '{transcript_text[:50]}'")
+    tts_engine = IndicParlerTTS(device="cpu")
 
     sentiment_val = None
     try:
@@ -637,7 +636,7 @@ async def process_turn(websocket: WebSocket, session: dict, transcript_text: str
     await websocket.send_json({"type": "state", "state": "verifying"})
     
     try:
-        tts_audio = await tts.synthesize({**intent, "language": detected_lang})
+        tts_audio = await tts_engine.synthesize({**intent, "language": detected_lang})
         if tts_audio and len(tts_audio) > 0:
             await websocket.send_bytes(tts_audio)
             logger.info(f"[{session['call_id']}] TTS audio synthesized: {len(tts_audio)} bytes")
@@ -698,7 +697,7 @@ async def handle_confirmation(websocket: WebSocket, session: dict, result: str):
         logger.info(f"[{session['call_id']}] Partial match, retry attempt {session['attempt']}")
         
         try:
-            retry_audio = await tts.synthesize({**session["last_intent"], "rephrase": True, "language": "en"})
+            retry_audio = await tts_engine.synthesize({**session["last_intent"], "rephrase": True, "language": "en"})
             if retry_audio and len(retry_audio) > 0:
                 await websocket.send_bytes(retry_audio)
             else:
