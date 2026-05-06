@@ -5,40 +5,22 @@ from dataclasses import dataclass, field
 from queue import Queue
 from threading import Thread
 from typing import Dict, Generator, List, Optional
-
+import google.api_core.exceptions
+from google import genai
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from fastapi import APIRouter, WebSocket
 from modules.stt import IndicConformerSTT
 from modules.tts import IndicParlerTTS
+from dotenv import load_dotenv
+
+load_dotenv()
 
 router = APIRouter()
 
 # Initialize STT and TTS models
 stt_model = IndicConformerSTT()
 tts_model = IndicParlerTTS()
-
-@router.websocket("/stream")
-async def stream_audio(websocket: WebSocket):
-    """WebSocket endpoint for streaming audio to STT and receiving TTS responses."""
-    await websocket.accept()
-    try:
-        while True:
-            audio_chunk = await websocket.receive_bytes()
-            transcript = stt_model.append_pcm(audio_chunk)
-
-            if transcript:
-                # Send transcript to TTS for synthesis
-                audio_response = tts_model.synthesize(transcript)
-                await websocket.send_bytes(audio_response)
-    except Exception as e:
-        await websocket.close()
-        print(f"[WebSocket Error]: {e}")
-
-
-def _escalation_generator():
-    """Yield the escalation message."""
-    yield "connecting to human agent"
 
 
 @dataclass
@@ -61,8 +43,10 @@ class Gemma4Agent:
         model_name: str = "gemma4",
         device: int = -1,
         max_new_tokens: int = 256,
+        client: genai.Client = None,
     ) -> None:
         self.model_name = model_name
+        self.client = client or genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
         self.device = device
         self.max_new_tokens = max_new_tokens
 
@@ -78,33 +62,44 @@ class Gemma4Agent:
         self._update_slots(user_text)
         prompt = self._build_prompt(user_text)
 
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
-        if self.device != -1 and torch.cuda.is_available():
-            input_ids = input_ids.to(self.device)
+        try:
+            # PRIMARY: Gemini Flash API
+            response = self.client.models.generate_content(
+                model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite"),
+                contents=prompt
+            )
+            # Simulate streaming or yield the whole text
+            yield response.text[cite: 2]
+        except google.api_core.exceptions.ServiceUnavailable, Exception as e:
+            print(f"Gemini failed: {e}. Switching to local Gemma fallback.")
+            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+            if self.device != -1 and torch.cuda.is_available():
+                input_ids = input_ids.to(self.device)
 
-        streamer = TextIteratorStreamer(
-            self.tokenizer,
-            skip_prompt=True,
-            skip_special_tokens=True,
-            timeout=10.0,
-        )
+            streamer = TextIteratorStreamer(
+                self.tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+                timeout=10.0,
+            )
 
-        thread = Thread(
-            target=self.model.generate,
-            kwargs={
-                "input_ids": input_ids,
-                "max_new_tokens": self.max_new_tokens,
-                "temperature": 0.7,
-                "do_sample": True,
-                "streamer": streamer,
-            },
-        )
-        thread.start()
+            thread = Thread(
+                target=self.model.generate,
+                kwargs={
+                    "input_ids": input_ids,
+                    "max_new_tokens": self.max_new_tokens,
+                    "temperature": 0.7,
+                    "do_sample": True,
+                    "streamer": streamer,
+                },
+            )
+            thread.start()
 
-        for new_text in streamer:
-            yield new_text
+            for new_text in streamer:
+                if new_text.strip():
+                    yield new_text
 
-        thread.join()
+            thread.join()
         self.state.history.append({"user": user_text, "assistant_prompt": prompt})
 
     def get_last_question(self) -> str:

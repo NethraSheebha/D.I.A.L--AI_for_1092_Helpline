@@ -25,6 +25,7 @@ from modules.nlu import IndicBERTIntentExtractor, IndicTrans2Translator, Dialect
 from modules.sentiment import PyannoteAcousticSentiment
 from modules.tts import IndicParlerTTS, initialize_tts
 from modules.confidence import ConfidenceScorer
+from modules.llm_agent import Gemma4Agent
 import modules.store as store
 
 load_dotenv()
@@ -92,6 +93,8 @@ redis_client: Optional[aioredis.Redis] = None
 vad: Optional[SileroVAD] = None
 # Note: STT and Analytics are now instantiated per-call in call_ws
 
+#LLM Agent
+agent = Gemma4Agent()
 
 async def redis_setex(key: str, ex: int, value: str):
     if redis_client:
@@ -133,10 +136,10 @@ async def get_session_from_call_id(call_id: str) -> Optional[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("+--------------------------------------------------+")
-    print("|           D.I.A.L. Backend v1.0                  |")
-    print("|   Models: Whisper-medium | Gemini-Flash | Edge-TTS |")
-    print("+--------------------------------------------------+")
+    print("+-----------------------------------------------------------+")
+    print("|                 D.I.A.L. Backend v1.0                     |")
+    print("| Models: Indic-Conformer | Gemini-Flash/Gemma4 | Indic-TTS |")
+    print("+-----------------------------------------------------------+")
     # Gemini configuration is handled in modules/nlu.py
     # genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     print("[STARTUP] Gemini SDK ready")
@@ -157,7 +160,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ PostgreSQL error: {str(e)[:100]}")
     
-    global vad, nlu_intent, sentiment, tts, confidence_scorer, dialect_fp
+    global vad, nlu_intent, sentiment, confidence_scorer, dialect_fp
     
     try:
         vad = SileroVAD(threshold=float(os.getenv("VAD_THRESHOLD", 0.5)))
@@ -634,23 +637,21 @@ async def process_turn(websocket: WebSocket, session: dict, transcript_text: str
         return
 
     await websocket.send_json({"type": "state", "state": "verifying"})
-    
-    try:
-        tts_audio = await tts_engine.synthesize({**intent, "language": detected_lang})
-        if tts_audio and len(tts_audio) > 0:
-            await websocket.send_bytes(tts_audio)
-            logger.info(f"[{session['call_id']}] TTS audio synthesized: {len(tts_audio)} bytes")
-        else:
-            print(f"[WS] TTS returned empty audio — skipping send")
-            await websocket.send_json({
-                "type": "alert",
-                "level": "warn", 
-                "message": "Audio synthesis unavailable — text-only mode"
-            })
-    except Exception as e:
-        logger.error(f"[{session['call_id']}] TTS synthesis failed: {type(e).__name__}: {str(e)[:100]}")
-        await websocket.send_json({"type": "alert", "level": "warn", "message": "Verification audio unavailable"})
 
+    ai_response = ""
+    async for text_chunk in agent.stream_response(transcript_text):
+        ai_response += text_chunk
+
+        try:
+            audio_chunk = await tts_engine.synthesize(text_chunk)
+            if audio_chunk:
+                await websocket.send_bytes(audio_chunk)
+        except Exception as e:
+            logger.error(f"Streaming TTS error: {e}")
+    
+    session["last_transcript"] = transcript_text
+    session["last_intent"] = intent
+    
     await redis_setex(f"session:{session['call_id']}", 3600, json.dumps(session))
 
 
