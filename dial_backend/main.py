@@ -23,8 +23,9 @@ from modules.stt import IndicConformerSTT, initialize_stt
 from modules.acoustic_analytics import AcousticAnalytics
 from modules.nlu import IndicBERTIntentExtractor, IndicTrans2Translator, DialectFingerprinter, generate_agent_response
 from modules.sentiment import PyannoteAcousticSentiment
-from modules.tts import CoquiTTS
+from modules.tts import IndicParlerTTS, initialize_tts
 from modules.confidence import ConfidenceScorer
+from modules.llm_agent import Gemma4Agent
 import modules.store as store
 
 load_dotenv()
@@ -110,6 +111,8 @@ active_call_id: Optional[str] = None
 active_sessions: dict = {}
 # Note: STT and Analytics are now instantiated per-call in call_ws
 
+#LLM Agent
+agent = Gemma4Agent()
 
 async def redis_setex(key: str, ex: int, value: str):
     if redis_client:
@@ -151,10 +154,10 @@ async def get_session_from_call_id(call_id: str) -> Optional[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("+--------------------------------------------------+")
-    print("|           D.I.A.L. Backend v1.0                  |")
-    print("|   Models: Whisper-medium | Gemini-Flash | Edge-TTS |")
-    print("+--------------------------------------------------+")
+    print("+-----------------------------------------------------------+")
+    print("|                 D.I.A.L. Backend v1.0                     |")
+    print("| Models: Indic-Conformer | Gemini-Flash/Gemma4 | Indic-TTS |")
+    print("+-----------------------------------------------------------+")
     # Gemini configuration is handled in modules/nlu.py
     # genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     print("[STARTUP] Gemini SDK ready")
@@ -175,7 +178,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ PostgreSQL error: {str(e)[:100]}")
     
-    global vad, nlu_intent, sentiment, tts, confidence_scorer, dialect_fp
+    global vad, nlu_intent, sentiment, confidence_scorer, dialect_fp
     
     try:
         vad = SileroVAD(threshold=float(os.getenv("VAD_THRESHOLD", 0.5)))
@@ -217,12 +220,11 @@ async def lifespan(app: FastAPI):
         dialect_fp = None
     
     try:
-        tts = CoquiTTS(model_name=os.getenv("TTS_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2"))
-        await tts.initialize()
-        logger.info("✅ TTS model loaded")
+        await initialize_tts()
+        logger.info("✅ TTS model initialized (Pipeline warmed up)")
     except Exception as e:
         logger.error(f"❌ TTS initialization failed: {str(e)[:100]}")
-        tts = None
+
     
     try:
         confidence_scorer = ConfidenceScorer()
@@ -326,9 +328,8 @@ async def health_check_full():
         },
         "stt": {
             "status": "ready" if initialize_stt is not None else "not_loaded",
-            "model": "FastWhisper",
-            "model_size": os.getenv("WHISPER_MODEL_SIZE", "medium"),
-            "device": os.getenv("WHISPER_DEVICE", "cpu")
+            "model": "ai4bharat/indic-conformer-600m-multilingual",
+            "device": "cpu"
         },
         "nlu_intent": {
             "status": "ready" if nlu_intent is not None else "not_loaded",
@@ -339,9 +340,9 @@ async def health_check_full():
             "model": "PyannoteAcoustic" if sentiment else None
         },
         "tts": {
-            "status": "ready" if tts is not None else "not_loaded",
-            "model": "Edge-TTS" if tts else None,
-            "model_name": "azure-neural-voices" if tts else None
+            "status": "ready" if initialize_tts is not None else "not_loaded",
+            "model_name": "ai4bharat/indic-parler-tts",
+            "device": "cpu"
         },
         "confidence": {
             "status": "ready" if confidence_scorer is not None else "not_loaded",
@@ -454,7 +455,7 @@ async def call_ws(websocket: WebSocket):
     logger.info(f"[{call_id}] New WebSocket connection established")
     
     # Initialize per-session engines
-    stt_engine = IndicConformerSTT(device=os.getenv("STT_DEVICE", "cpu"))
+    stt_engine = IndicConformerSTT(device="cpu")
     analytics_engine = AcousticAnalytics()
     
     audio_buffer = bytearray()
@@ -663,6 +664,7 @@ async def call_ws(websocket: WebSocket):
 async def process_turn(websocket: WebSocket, session: dict, transcript_text: str, audio_bytes: bytes):
     session["turn_number"] += 1
     logger.info(f"[{session['call_id']}] Processing turn {session['turn_number']} with transcript: '{transcript_text[:50]}'")
+    tts_engine = IndicParlerTTS(device="cpu")
 
     sentiment_val = None
     try:
@@ -814,23 +816,21 @@ async def process_turn(websocket: WebSocket, session: dict, transcript_text: str
         return
 
     await websocket.send_json({"type": "state", "state": "verifying"})
-    
-    try:
-        tts_audio = await tts.synthesize({**intent, "language": detected_lang})
-        if tts_audio and len(tts_audio) > 0:
-            await websocket.send_bytes(tts_audio)
-            logger.info(f"[{session['call_id']}] TTS audio synthesized: {len(tts_audio)} bytes")
-        else:
-            print(f"[WS] TTS returned empty audio — skipping send")
-            await websocket.send_json({
-                "type": "alert",
-                "level": "warn", 
-                "message": "Audio synthesis unavailable — text-only mode"
-            })
-    except Exception as e:
-        logger.error(f"[{session['call_id']}] TTS synthesis failed: {type(e).__name__}: {str(e)[:100]}")
-        await websocket.send_json({"type": "alert", "level": "warn", "message": "Verification audio unavailable"})
 
+    ai_response = ""
+    async for text_chunk in agent.stream_response(transcript_text):
+        ai_response += text_chunk
+
+        try:
+            audio_chunk = await tts_engine.synthesize(text_chunk)
+            if audio_chunk:
+                await websocket.send_bytes(audio_chunk)
+        except Exception as e:
+            logger.error(f"Streaming TTS error: {e}")
+    
+    session["last_transcript"] = transcript_text
+    session["last_intent"] = intent
+    
     await redis_setex(f"session:{session['call_id']}", 3600, json.dumps(session))
 
 
@@ -877,7 +877,7 @@ async def handle_confirmation(websocket: WebSocket, session: dict, result: str):
         logger.info(f"[{session['call_id']}] Partial match, retry attempt {session['attempt']}")
         
         try:
-            retry_audio = await tts.synthesize({**session["last_intent"], "rephrase": True, "language": "en"})
+            retry_audio = await tts_engine.synthesize({**session["last_intent"], "rephrase": True, "language": "en"})
             if retry_audio and len(retry_audio) > 0:
                 await websocket.send_bytes(retry_audio)
             else:

@@ -1,6 +1,12 @@
 import os
 import io
 import asyncio
+import re
+from typing import Iterator, List
+
+import numpy as np
+import soundfile as sf
+from transformers import pipeline
 from dotenv import load_dotenv
 
 try:
@@ -50,111 +56,71 @@ ESCALATION_TEMPLATES = {
 }
 
 
-# --- Main TTS synthesis function ---------------------------------------------
+class IndicParlerTTS:
+    """Sentence-level streaming TTS wrapper for ai4bharat/indic-parler-tts."""
 
-async def synthesize(intent: dict) -> bytes:
-    """
-    Converts text to speech using Microsoft Edge TTS neural voices.
+    PUNCTUATION_PATTERN = re.compile(r"(.+?[\,\.!\?])(?:\s+|$)", re.DOTALL)
 
-    This is the voice that speaks back to the citizen during the call.
-
-    Input: intent dict with keys:
-        - language: "en", "kn", or "hi"
-        - issue: the classified complaint type
-        - location: extracted location or None
-        - rephrase: True if this is a second attempt (optional)
-        - escalating: True if handing off to human agent (optional)
-        - _raw_text: if set, speak this text directly (bypasses templates)
-
-    Output: MP3 audio bytes to be sent over WebSocket to the browser
-
-    Returns empty bytes b"" on failure -- main.py handles this gracefully
-    """
-    lang = intent.get("language", "en")
-    # Normalize language code -- faster-whisper returns full codes like "kannada"
-    if lang in ("kannada", "kn-IN"):
-        lang = "kn"
-    elif lang in ("hindi", "hi-IN"):
-        lang = "hi"
-    elif lang not in VOICE_MAP:
-        lang = "en"  # default to English if unknown
-
-    voice = VOICE_MAP.get(lang, DEFAULT_VOICE)
-
-    # If _raw_text is provided, use it directly instead of templates
-    if intent.get("_raw_text"):
-        text = intent["_raw_text"]
-    elif intent.get("escalating"):
-        text = ESCALATION_TEMPLATES.get(lang, ESCALATION_TEMPLATES["en"])
-    elif intent.get("rephrase"):
-        text = REPHRASE_TEMPLATES.get(lang, REPHRASE_TEMPLATES["en"])
-    else:
-        template = VERIFICATION_TEMPLATES.get(lang, VERIFICATION_TEMPLATES["en"])
-        location = intent.get("location") or "your area"
-        issue = intent.get("issue", "the issue")
-        text = template.format(issue=issue, location=location)
-
-    print(f"[TTS] Synthesizing | voice={voice} | text='{text[:60]}...'")
-
-    if edge_tts is None:
-        print("[TTS] Edge-TTS unavailable; returning empty audio")
-        return b""
-
-    try:
-        # Edge-TTS streams audio chunks asynchronously.
-        # We collect all chunks into a BytesIO buffer and return as bytes.
-        communicate = edge_tts.Communicate(text=text, voice=voice)
-        audio_buffer = io.BytesIO()
-
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                # Only write audio chunks, skip metadata chunks
-                audio_buffer.write(chunk["data"])
-
-        audio_buffer.seek(0)
-        result = audio_buffer.read()
-
-        if len(result) == 0:
-            print(f"[TTS] Warning: empty audio returned for text='{text[:40]}'")
-            return b""
-
-        print(f"[TTS] Success | {len(result)} bytes | voice={voice}")
-        return result
-
-    except Exception as e:
-        print(f"[TTS] Error: {type(e).__name__}: {e}")
-        # Return empty bytes -- the WebSocket handler in main.py
-        # checks for empty bytes and skips sending audio gracefully
-        return b""
-
-
-async def synthesize_text(text: str, lang: str = "en") -> bytes:
-    """
-    Helper function: synthesize any custom text directly.
-    Used for custom messages not tied to the intent templates.
-    Example: synthesize_text("Your complaint has been registered.", "kn")
-    """
-    return await synthesize({
-        "language": lang,
-        "issue": text,
-        "location": "",
-        "_raw_text": text
-    })
-
-
-# --- Backward-compatible class wrapper ---------------------------------------
-# main.py imports CoquiTTS by class name. This wrapper delegates to the
-# module-level synthesize() function so existing code doesn't break.
-
-class CoquiTTS:
-    def __init__(self, model_name: str = "edge-tts"):
+    def __init__(
+        self,
+        model_name: str = "ai4bharat/indic-parler-tts",
+        sample_rate: int = 24000,
+        device: int = -1,
+    ) -> None:
         self.model_name = model_name
+        self.sample_rate = sample_rate
+        self.device = device
+        self.pipeline = pipeline(
+            task="text-to-speech",
+            model=self.model_name,
+            device=self.device,
+        )
+        self.buffer = ""
 
-    async def initialize(self):
-        print("[TTS] Edge-TTS ready (CoquiTTS wrapper active)")
+    def enqueue_text(self, text: str, continue_flag: bool = True) -> List[bytes]:
+        """Buffer text and synthesize completed segments when punctuation is seen."""
+        self.buffer += (" " if self.buffer else "") + text.strip()
+        chunks: List[bytes] = []
 
-    async def synthesize(self, intent: dict) -> bytes:
-        return await synthesize(intent)
+        while True:
+            match = self.PUNCTUATION_PATTERN.match(self.buffer)
+            if not match:
+                break
+            segment = match.group(1).strip()
+            self.buffer = self.buffer[match.end():].strip()
+            chunks.append(self.synthesize(segment, continue_flag=continue_flag))
 
-    async def generate_verification_summary(self, intent: str, entities: dict, language: str) -> bytes:
-        return await synthesize_text(intent, language)
+        return chunks
+
+    def flush(self, continue_flag: bool = False) -> bytes | None:
+        """Synthesize any remaining buffered text at the end of a turn."""
+        if not self.buffer:
+            return None
+        segment = self.buffer.strip()
+        self.buffer = ""
+        return self.synthesize(segment, continue_flag=continue_flag)
+
+    def synthesize(self, text_chunk: str, continue_flag: bool = True) -> bytes:
+        """Convert a textual segment into raw PCM audio bytes."""
+        output = self.pipeline(text_chunk)
+        audio = output["audio"] if isinstance(output, dict) else output
+
+        if hasattr(audio, "array"):
+            audio_array = audio.array
+        elif isinstance(audio, np.ndarray):
+            audio_array = audio
+        else:
+            raise RuntimeError("Unexpected audio output format from TTS pipeline")
+
+        pcm_int16 = self._float32_to_int16(audio_array)
+        return pcm_int16.tobytes()
+
+    def _float32_to_int16(self, audio: np.ndarray) -> np.ndarray:
+        clipped = np.clip(audio, -1.0, 1.0)
+        return (clipped * 32767).astype(np.int16)
+
+
+# Global initialization function called by FastAPI lifespan
+async def initialize_tts():
+    print("[TTS] Initializing Indic-Parler model...")
+    return IndicParlerTTS()
