@@ -1,8 +1,12 @@
 import os
 import io
 import asyncio
-import edge_tts
 from dotenv import load_dotenv
+
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
 
 load_dotenv()
 
@@ -91,6 +95,10 @@ async def synthesize(intent: dict) -> bytes:
         text = template.format(issue=issue, location=location)
 
     print(f"[TTS] Synthesizing | voice={voice} | text='{text[:60]}...'")
+
+    if edge_tts is None:
+        print("[TTS] Edge-TTS unavailable; returning empty audio")
+        return b""
 
     try:
         # Edge-TTS streams audio chunks asynchronously.

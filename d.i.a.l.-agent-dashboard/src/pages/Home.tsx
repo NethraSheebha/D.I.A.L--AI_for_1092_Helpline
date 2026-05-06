@@ -18,11 +18,31 @@ import {
 } from '../components/Shared';
 import { MOCK_QUEUE, QueueItemData } from '../mocks';
 import { cn } from '../lib/utils';
+import { fetchRecentCalls } from '../lib/backend';
 
 export default function Home() {
   const navigate = useNavigate();
   const [calls, setCalls] = React.useState<QueueItemData[]>(MOCK_QUEUE);
   const [showCriticalToast, setShowCriticalToast] = React.useState(false);
+
+  React.useEffect(() => {
+    let mounted = true;
+
+    fetchRecentCalls()
+      .then((liveCalls) => {
+        if (!mounted || liveCalls.length === 0) {
+          return;
+        }
+        setCalls(liveCalls);
+      })
+      .catch(() => {
+        // Keep mock data as a graceful fallback when backend is unavailable.
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // Sort calls: Critical first, then High, then others
   const sortedCalls = [...calls].sort((a, b) => {

@@ -5,22 +5,50 @@ import { useNavigate } from 'react-router-dom';
 import { PrimaryButton, Divider } from '../components/Shared';
 import { cn } from '../lib/utils';
 
+const API_BASE_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim() || 'http://127.0.0.1:8000';
+
 export default function Login() {
   const navigate = useNavigate();
   const [role, setRole] = React.useState<'agent' | 'supervisor'>('agent');
+  const [username, setUsername] = React.useState('GOV-AGENT-7721');
+  const [password, setPassword] = React.useState('password123');
   const [isSubmitting, setIsSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
     setError(null);
     
-    // Simulate auth delay
-    setTimeout(() => {
-      setIsSubmitting(false);
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username,
+          password,
+          role,
+        }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.detail || 'Login failed');
+      }
+
+      const data = await response.json();
+      
+      // Store auth token and user info in localStorage
+      localStorage.setItem('auth_token', data.token);
+      localStorage.setItem('user_role', data.role);
+      localStorage.setItem('username', data.username);
+      
+      // Navigate to agent home
       navigate('/agent/home');
-    }, 1500);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Authentication failed');
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -84,7 +112,8 @@ export default function Login() {
                   <input 
                     type="text" 
                     placeholder="Terminal ID (K-G-882)"
-                    defaultValue="GOV-AGENT-7721"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
                     className="w-full bg-brand-bg border border-brand-border rounded-xl py-3.5 pl-12 pr-4 text-sm text-white placeholder:text-gray-700 outline-none focus:border-brand-primary transition-all focus:ring-4 focus:ring-brand-primary/10"
                   />
                 </div>
@@ -96,7 +125,8 @@ export default function Login() {
                   <input 
                     type="password" 
                     placeholder="Secure RSA PIN"
-                    defaultValue="password123"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
                     className="w-full bg-brand-bg border border-brand-border rounded-xl py-3.5 pl-12 pr-4 text-sm text-white placeholder:text-gray-700 outline-none focus:border-brand-primary transition-all focus:ring-4 focus:ring-brand-primary/10"
                   />
                 </div>

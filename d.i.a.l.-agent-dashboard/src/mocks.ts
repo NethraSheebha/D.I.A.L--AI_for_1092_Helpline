@@ -14,10 +14,22 @@ export interface TranscriptLineData {
   ambiguities?: { start: number; length: number; suggestions: string[] }[];
 }
 
+export interface AcousticFeatures {
+  zcr?: number;      // Zero-crossing rate (clarity)
+  rms?: number;      // RMS volume
+  centroid?: number; // Spectral centroid (pitch indicator)
+}
+
 export interface CallSignals {
   confidence: number;
-  emotion: 'Calm' | 'Anxious' | 'Distressed' | 'Angry';
+  emotion: 'Calm' | 'Confused' | 'Anxious' | 'Distressed' | 'Panicked';
   speechRate: 'Normal' | 'Fast' | 'Slow';
+  wpm: number;
+  stressScore?: number;
+  stressIntensity?: number;  // 1-5 scale
+  intent?: string;
+  intentConfidence?: number;
+  acousticFeatures?: AcousticFeatures;
 }
 
 export const MOCK_QUEUE: QueueItemData[] = [

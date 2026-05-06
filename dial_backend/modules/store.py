@@ -1,9 +1,13 @@
-import asyncpg
 import os
 import json
 from typing import Dict, List, Optional
 from uuid import uuid4
 from datetime import datetime
+
+try:
+    import asyncpg
+except ImportError:
+    asyncpg = None
 
 pool = None
 
@@ -17,6 +21,9 @@ mock_storage = {
 
 async def init_db():
     global pool
+    if asyncpg is None:
+        print("⚠️ PostgreSQL driver unavailable; using in-memory storage")
+        return
     try:
         db_url = os.getenv("POSTGRES_URL", "postgresql://user:password@localhost:5432/dial_db")
         pool = await asyncpg.create_pool(db_url, min_size=2, max_size=10)

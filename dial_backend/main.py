@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from modules.vad import SileroVAD, ChunkBuffer
 from modules.stt import IndicConformerSTT, initialize_stt
 from modules.acoustic_analytics import AcousticAnalytics
-from modules.nlu import IndicBERTIntentExtractor, IndicTrans2Translator, DialectFingerprinter
+from modules.nlu import IndicBERTIntentExtractor, IndicTrans2Translator, DialectFingerprinter, generate_agent_response
 from modules.sentiment import PyannoteAcousticSentiment
 from modules.tts import CoquiTTS
 from modules.confidence import ConfidenceScorer
@@ -37,12 +37,26 @@ logging.basicConfig(
 logger = logging.getLogger("dial_backend")
 
 # Pydantic models for API requests/responses
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    role: str  # 'agent' or 'supervisor'
+
+class LoginResponse(BaseModel):
+    token: str
+    role: str
+    username: str
+    message: str
+
 class AgentIntentCorrection(BaseModel):
     turn_id: str
     corrected_intent: dict
 
 class AgentEscalationRequest(BaseModel):
     reason: str
+
+class AgentResponseRequest(BaseModel):
+    response: str
 
 class TurnResponse(BaseModel):
     turn_id: str
@@ -90,6 +104,10 @@ class StatsResponse(BaseModel):
 # Global variables
 redis_client: Optional[aioredis.Redis] = None
 vad: Optional[SileroVAD] = None
+# Track the currently streaming call
+active_call_id: Optional[str] = None
+# Active websocket registry for direct delivery when Redis is unavailable
+active_sessions: dict = {}
 # Note: STT and Analytics are now instantiated per-call in call_ws
 
 
@@ -366,6 +384,39 @@ async def health_check_full():
     }
 
 
+@app.post("/api/login")
+async def login(request: LoginRequest):
+    """
+    Simple authentication endpoint.
+    For demo: accepts any username/password pair.
+    In production: validate against user database.
+    """
+    if not request.username or not request.password:
+        raise HTTPException(status_code=400, detail="Username and password required")
+    
+    if request.role not in ["agent", "supervisor"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    
+    # Generate a simple token (in production: use JWT or similar)
+    token = str(uuid.uuid4())
+    
+    # Store session in Redis (30 min expiry)
+    session_data = {
+        "username": request.username,
+        "role": request.role,
+        "created_at": datetime.utcnow().isoformat(),
+        "expires_at": (datetime.utcnow() + timedelta(minutes=30)).isoformat()
+    }
+    await redis_setex(f"auth_token:{token}", 1800, json.dumps(session_data))
+    
+    return LoginResponse(
+        token=token,
+        role=request.role,
+        username=request.username,
+        message=f"Welcome {request.username}! Session established."
+    )
+
+
 @app.get("/api/call/{call_id}/history")
 async def get_call_history(call_id: str):
     context = await store.get_call_context(call_id)
@@ -421,9 +472,62 @@ async def call_ws(websocket: WebSocket):
     }
 
     try:
+        global active_call_id
         await store.create_call(call_id)
+        active_call_id = call_id  # Mark this as the active streaming call
         await redis_setex(f"session:{call_id}", 3600, json.dumps(session))
-        logger.info(f"[{call_id}] WebSocket session initialized in database")
+        logger.info(f"[{call_id}] WebSocket session initialized in database and marked as active")
+
+        # Register in-memory active session for direct delivery when Redis is unavailable
+        try:
+            active_sessions[call_id] = websocket
+        except Exception:
+            pass
+
+        # If Redis is available, start a background listener to forward agent messages to caller
+        redis_listener_task = None
+        if redis_client:
+            async def _redis_listener():
+                try:
+                    pubsub = redis_client.pubsub()
+                    await pubsub.subscribe(f"call_updates:{call_id}")
+                    async for message in pubsub.listen():
+                        if message.get("type") != "message":
+                            continue
+                        try:
+                            payload = message.get("data")
+                            if isinstance(payload, bytes):
+                                payload = payload.decode()
+                            update = json.loads(payload or '{}')
+                        except Exception:
+                            continue
+
+                        utype = update.get("type")
+                        # Forward agent response text and synthesize audio for caller
+                        if utype == "agent_response":
+                            resp_text = update.get("response_text", "")
+                            try:
+                                await websocket.send_json({"type": "agent_message", "text": resp_text})
+                            except Exception:
+                                pass
+                            try:
+                                audio_bytes = await tts.synthesize({"_raw_text": resp_text, "language": session.get("language", "en"), "issue": resp_text, "location": ""})
+                                if audio_bytes:
+                                    await websocket.send_bytes(audio_bytes)
+                            except Exception as e:
+                                logger.error(f"[{call_id}] TTS synth for agent_response failed: {e}")
+
+                        # Forward AI generation chunks to caller as info (optional)
+                        if utype == "ai_chunk":
+                            try:
+                                await websocket.send_json({"type": "ai_chunk", "chunk": update.get("chunk", "")})
+                            except Exception:
+                                pass
+
+                except Exception as e:
+                    logger.error(f"[{call_id}] Redis listener error: {e}")
+
+            redis_listener_task = asyncio.create_task(_redis_listener())
 
         try:
             while True:
@@ -437,6 +541,29 @@ async def call_ws(websocket: WebSocket):
                         
                         if msg.get("type") == "confirm":
                             await handle_confirmation(websocket, session, msg.get("result"))
+                        elif msg.get("type") == "agent_message_received":
+                            # Caller client notifies backend that agent message playback was received
+                            try:
+                                ack_payload = {
+                                    "type": "agent_ack",
+                                    "call_id": call_id,
+                                    "turn_id": session.get("last_turn_id"),
+                                    "timestamp": datetime.now().isoformat(),
+                                    "meta": msg.get("meta", {})
+                                }
+                                if redis_client:
+                                    await redis_client.publish(f"call_updates:{call_id}", json.dumps(ack_payload))
+                                    logger.info(f"[{call_id}] Published agent_ack to call_updates")
+                                else:
+                                    # If no Redis, forward to agent websocket(s) if present in registry
+                                    agent_ws = active_sessions.get(call_id)
+                                    if agent_ws:
+                                        try:
+                                            await agent_ws.send_json({"type": "agent_ack", "data": ack_payload})
+                                        except Exception:
+                                            pass
+                            except Exception as e:
+                                logger.error(f"[{call_id}] Failed to handle agent_message_received: {e}")
                         elif msg.get("type") == "force_process":
                             if len(audio_buffer) > 0:
                                 logger.info(f"[{call_id}] Force processing {len(audio_buffer)} bytes")
@@ -496,15 +623,39 @@ async def call_ws(websocket: WebSocket):
 
         except WebSocketDisconnect:
             logger.info(f"[{call_id}] WebSocket disconnected gracefully")
+            active_call_id = None  # Clear active call
             await redis_delete(f"session:{call_id}")
+            # cleanup in-memory registry
+            try:
+                if call_id in active_sessions:
+                    del active_sessions[call_id]
+            except Exception:
+                pass
+            # cancel redis listener if running
+            try:
+                if redis_listener_task is not None:
+                    redis_listener_task.cancel()
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"[{call_id}] WebSocket error in receive loop: {type(e).__name__}: {str(e)[:100]}")
             import traceback
             logger.error(f"[{call_id}] Traceback: {traceback.format_exc()[:500]}")
             await redis_delete(f"session:{call_id}")
+            try:
+                if call_id in active_sessions:
+                    del active_sessions[call_id]
+            except Exception:
+                pass
+            try:
+                if redis_listener_task is not None:
+                    redis_listener_task.cancel()
+            except Exception:
+                pass
     
     except Exception as e:
         logger.error(f"[{call_id}] WebSocket initialization error: {type(e).__name__}: {str(e)[:100]}")
+        active_call_id = None  # Clear active call on error
         await redis_delete(f"session:{call_id}")
 
 
@@ -577,6 +728,29 @@ async def process_turn(websocket: WebSocket, session: dict, transcript_text: str
     confidence = confidence_scorer.compute_confidence(intent, sentiment_val, session["attempt"])
     escalate, reason = confidence_scorer.should_escalate(confidence, sentiment_val, session["attempt"])
     
+    # Calculate estimated WPM from transcript (5 second average turn duration)
+    word_count = len(transcript_text.split())
+    estimated_wpm = (word_count / 5.0) * 60 if word_count > 0 else 0.0
+    
+    # Generate AI response based on intent and sentiment
+    ai_response = await generate_agent_response(
+        transcript=transcript_text,
+        intent=intent,
+        sentiment=sentiment_val,
+        language=session.get("language", "en")
+    )
+    # Publish incremental AI chunks for live agent preview (simple sentence split)
+    if redis_client and ai_response:
+        try:
+            chunks = [c.strip() for c in ai_response.replace('\n', ' ').split('. ') if c.strip()]
+            for c in chunks:
+                await redis_client.publish(
+                    f"call_updates:{session['call_id']}",
+                    json.dumps({"type": "ai_chunk", "chunk": c})
+                )
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning(f"[{session['call_id']}] Failed to publish ai_chunk: {str(e)[:50]}")
     logger.info(f"[{session['call_id']}] Confidence: {confidence:.2f}, Escalate: {escalate}, Reason: {reason}")
 
     await websocket.send_json({
@@ -587,6 +761,7 @@ async def process_turn(websocket: WebSocket, session: dict, transcript_text: str
     })
 
     # Publish turn update to Redis pub/sub for agent dashboard
+    # Publish turn update including dialect profile so agent UI sees dialecting info
     if redis_client:
         try:
             await redis_client.publish(
@@ -599,6 +774,10 @@ async def process_turn(websocket: WebSocket, session: dict, transcript_text: str
                     "intent": intent,
                     "confidence": confidence,
                     "sentiment": sentiment_val,
+                    "speech_speed_wpm": estimated_wpm,
+                    "ai_response": ai_response,
+                    "dialect": dialect_result.get("dialect"),
+                    "dialect_profile": dialect_result.get("profile", {}),
                     "timestamp": datetime.now().isoformat()
                 })
             )
@@ -849,9 +1028,62 @@ async def escalate_call(call_id: str, escalation: AgentEscalationRequest):
         logger.error(f"Error escalating call {call_id}: {type(e).__name__}: {str(e)[:100]}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@agent_router.post("/call/{call_id}/response", status_code=200)
+async def send_agent_response(call_id: str, payload: AgentResponseRequest):
+    """Agent sends synthesized response to citizen"""
+    try:
+        session = await get_session_from_call_id(call_id)
+        if not session:
+            logger.warning(f"Agent response attempted for non-existent session: {call_id}")
+            raise HTTPException(status_code=404, detail="Call session not found")
+        
+        response_text = payload.response.strip()
+        if not response_text:
+            raise HTTPException(status_code=400, detail="Response cannot be empty")
+        
+        logger.info(f"Agent sending response to call {call_id}: {response_text[:100]}")
+        
+        # Publish agent response to Redis pub/sub for live updates
+        if redis_client:
+            try:
+                await redis_client.publish(
+                    f"call_updates:{call_id}",
+                    json.dumps({
+                        "type": "agent_response",
+                        "response_text": response_text,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                )
+            except Exception as e:
+                logger.warning(f"Failed to publish agent response: {str(e)[:50]}")
+        else:
+            # Fallback: deliver directly to in-memory websocket if available
+            try:
+                ws = active_sessions.get(call_id)
+                if ws:
+                    await ws.send_json({"type": "agent_message", "text": response_text})
+                    try:
+                        audio_bytes = await tts.synthesize({"_raw_text": response_text, "language": session.get("language", "en"), "issue": response_text, "location": ""})
+                        if audio_bytes:
+                            await ws.send_bytes(audio_bytes)
+                    except Exception as e:
+                        logger.error(f"{call_id} - TTS synth fallback failed: {e}")
+            except Exception as e:
+                logger.warning(f"Fallback delivery to active session failed: {e}")
+        
+        # Optionally: Synthesize TTS audio and queue for playback
+        # (This can be enhanced with TTS synthesis later)
+        
+        return {"status": "sent", "call_id": call_id, "response_text": response_text}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending agent response for {call_id}: {type(e).__name__}: {str(e)[:100]}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @agent_router.get("/calls/recent", response_model=LatestCallsResponse)
 async def get_recent_calls():
-    """Get last 20 calls summary"""
+    """Get last 20 calls summary, with active call first"""
     try:
         calls = await store.get_recent_calls(20)
         call_summaries = [
@@ -864,6 +1096,15 @@ async def get_recent_calls():
             )
             for c in calls
         ]
+        
+        # Prioritize the active streaming call
+        if active_call_id:
+            active_call = next((c for c in call_summaries if c.call_id == active_call_id), None)
+            if active_call:
+                call_summaries.remove(active_call)
+                call_summaries.insert(0, active_call)
+                logger.info(f"Active streaming call {active_call_id} prioritized in recent calls")
+        
         logger.info(f"Agent retrieved recent calls: {len(call_summaries)} calls")
         return LatestCallsResponse(calls=call_summaries)
     except Exception as e:

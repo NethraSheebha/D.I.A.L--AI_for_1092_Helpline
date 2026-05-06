@@ -44,6 +44,48 @@ import {
 } from '../components/Shared';
 import { MOCK_QUEUE, MOCK_TRANSCRIPT_BASE, MOCK_CLUSTERS, TranscriptLineData, CallSignals, QueueItemData } from '../mocks';
 import { cn } from '../lib/utils';
+import { fetchRecentCalls, fetchCallContext, mapTurnsToTranscript, subscribeAgentUpdates, escalateCall, sendAgentResponse } from '../lib/backend';
+
+function mapSentimentToEmotion(label?: string): CallSignals['emotion'] {
+  switch ((label || '').toLowerCase()) {
+    case 'calm':
+      return 'Calm';
+    case 'confused':
+      return 'Confused';
+    case 'urgent':
+    case 'anxious':
+      return 'Anxious';
+    case 'distressed':
+      return 'Distressed';
+    case 'panicked':
+      return 'Panicked';
+    default:
+      return 'Calm';
+  }
+}
+
+function getSpeedRateFromWPM(wpm: number): CallSignals['speechRate'] {
+  if (wpm > 180) return 'Fast';
+  if (wpm < 80) return 'Slow';
+  return 'Normal';
+}
+
+function getStressLabel(intensity?: number): string {
+  if (!intensity) return 'Normal';
+  if (intensity >= 4.5) return 'Critical';
+  if (intensity >= 3.5) return 'High';
+  if (intensity >= 2.5) return 'Moderate';
+  if (intensity >= 1.5) return 'Elevated';
+  return 'Calm';
+}
+
+function getAcousticLabel(feature?: number): string {
+  if (!feature) return 'Normal';
+  if (feature > 0.8) return 'High';
+  if (feature > 0.6) return 'Moderate';
+  if (feature > 0.4) return 'Elevated';
+  return 'Low';
+}
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -51,7 +93,17 @@ export default function Dashboard() {
   const initialCall = location.state?.initialCall as QueueItemData | null;
 
   const [transcript, setTranscript] = React.useState<TranscriptLineData[]>(MOCK_TRANSCRIPT_BASE);
-  const [signals, setSignals] = React.useState<CallSignals>({ confidence: 92, emotion: 'Anxious', speechRate: 'Fast' });
+  const [signals, setSignals] = React.useState<CallSignals>({ 
+    confidence: 92, 
+    emotion: 'Anxious', 
+    speechRate: 'Fast', 
+    wpm: 145, 
+    stressScore: 0.65,
+    stressIntensity: 3,
+    intent: 'Hazard Report',
+    intentConfidence: 0.92,
+    acousticFeatures: { zcr: 0.12, rms: 0.45, centroid: 2100 }
+  });
   const [timer, setTimer] = React.useState(154);
   const [queue, setQueue] = React.useState<QueueItemData[]>(MOCK_QUEUE);
   const [isMuted, setIsMuted] = React.useState(false);
@@ -64,8 +116,35 @@ export default function Dashboard() {
   const [isLeaveModalOpen, setIsLeaveModalOpen] = React.useState(false);
   const [toast, setToast] = React.useState<{ msg: string; type: 'info' | 'warning' | 'critical' } | null>(null);
   const [isDetailDrawerOpen, setIsDetailDrawerOpen] = React.useState(false);
+  const [isSignalDetailOpen, setIsSignalDetailOpen] = React.useState(false);
+  const [isCorrectionOpen, setIsCorrectionOpen] = React.useState(false);
+  const [correctionTurnId, setCorrectionTurnId] = React.useState<string | null>(null);
+  const [correctionText, setCorrectionText] = React.useState('');
   const [expandedClusterId, setExpandedClusterId] = React.useState<string | null>(null);
   const [isQueueCollapsed, setIsQueueCollapsed] = React.useState(false);
+
+  React.useEffect(() => {
+    let mounted = true;
+
+    fetchRecentCalls()
+      .then((liveCalls) => {
+        if (!mounted || liveCalls.length === 0) {
+          return;
+        }
+
+        setQueue(liveCalls);
+        if (!initialCall) {
+          setActiveCall(liveCalls[0] ?? null);
+        }
+      })
+      .catch(() => {
+        // Keep mock queue when backend is unavailable.
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, [initialCall]);
 
   // Filter for Priority Queue (Critical/High only)
   const priorityQueue = queue.filter(item => 
@@ -89,48 +168,155 @@ export default function Dashboard() {
 
   React.useEffect(scrollToBottom, [transcript]);
 
-  // Mock real-time updates
+  // Keep queue aging and on-screen timer running for the operator UI.
   React.useEffect(() => {
     const tick = setInterval(() => {
       setTimer(t => t + 1);
       setQueue(q => q.map(item => ({ ...item, waitTime: item.waitTime + 1 })));
-      
-      setSignals(curr => ({
-        ...curr,
-        confidence: Math.max(10, Math.min(100, curr.confidence + (Math.random() > 0.8 ? (Math.random() * 4 - 2) : 0)))
-      }));
     }, 1000);
-
-    const transTimeout = setTimeout(() => {
-      setTranscript(prev => [...prev, { 
-        id: `t${Date.now()}`, 
-        speaker: 'citizen', 
-        text: "I think the location is precisely at the sharp turn near the landmark. Can you verify this?",
-        ambiguities: [{ start: 24, length: 9, suggestions: ['precisely', 'previously'] }]
-      }]);
-      setIsSummaryReady(true);
-      setToast({ msg: "New Intelligence: Intent Analysis Complete", type: "info" });
-    }, 5000);
 
     return () => {
       clearInterval(tick);
-      clearTimeout(transTimeout);
     };
   }, []);
+
+  React.useEffect(() => {
+    if (!activeCall) {
+      return;
+    }
+
+    let mounted = true;
+
+    fetchCallContext(activeCall.id)
+      .then((context) => {
+        if (!mounted) {
+          return;
+        }
+
+        const turns = mapTurnsToTranscript(context.turns || []);
+        if (turns.length > 0) {
+          setTranscript(turns);
+        }
+      })
+      .catch(() => {
+        // Keep existing transcript when context retrieval fails.
+      });
+
+    const unsubscribe = subscribeAgentUpdates(activeCall.id, {
+      onMessage: (envelope) => {
+        if (envelope.type !== 'call_update') {
+          return;
+        }
+
+        const update = envelope.data as Record<string, unknown>;
+        const updateType = String(update.type || '');
+
+        if (updateType === 'turn_processed') {
+          const transcriptText = String(update.transcript || '').trim();
+          const confidenceRaw = Number(update.confidence ?? 0);
+          const confidencePct = Math.round(Math.max(0, Math.min(1, confidenceRaw)) * 100);
+          const sentiment = update.sentiment as Record<string, unknown> | undefined;
+          const wpm = Number(update.speech_speed_wpm ?? 0);
+          const stressScore = sentiment?.ipl ? (Number(sentiment.ipl) / 5) : 0;
+          const stressIntensity = Number(sentiment?.ipl ?? 1);
+          const intentData = update.intent as Record<string, unknown> | undefined;
+          const acousticFeatures = sentiment?.features as Record<string, number> | undefined;
+          const aiResponse = String(update.ai_response || '').trim();
+
+          if (transcriptText) {
+            setTranscript((prev) => [
+              ...prev,
+              {
+                id: `live-${Date.now()}`,
+                speaker: 'citizen',
+                text: transcriptText,
+              },
+            ]);
+          }
+
+          setSignals((curr) => ({
+            ...curr,
+            confidence: confidencePct,
+            emotion: mapSentimentToEmotion(sentiment?.label as string),
+            speechRate: getSpeedRateFromWPM(wpm),
+            wpm: Math.round(wpm),
+            stressScore: stressScore,
+            stressIntensity: stressIntensity,
+            intent: String(intentData?.intent ?? 'Unknown'),
+            intentConfidence: Number(intentData?.confidence ?? 0),
+            acousticFeatures: acousticFeatures,
+          }));
+          
+          if (aiResponse) {
+            setSummaryScript(aiResponse);
+          }
+          
+          setIsSummaryReady(true);
+          setToast({ msg: 'AI Response Generated - Ready for Review', type: 'info' });
+        }
+
+        if (updateType === 'escalation' || updateType === 'manual_escalation') {
+          setToast({ msg: 'Escalation triggered. Supervisor notified.', type: 'critical' });
+        }
+
+        if (updateType === 'ai_chunk') {
+          const chunk = String(update.chunk || '').trim();
+          if (chunk) {
+            setSummaryScript((prev) => (prev ? `${prev} ${chunk}` : chunk));
+            setIsSummaryReady(true);
+          }
+        }
+
+        if (updateType === 'confirmation') {
+          const result = String(update.result || '');
+          if (result === 'full_match') {
+            setToast({ msg: 'Citizen confirmed understanding.', type: 'info' });
+          }
+        }
+      },
+      onError: () => {
+        setToast({ msg: 'Live feed disconnected. Retrying on call switch.', type: 'warning' });
+      },
+    });
+
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, [activeCall]);
 
   const handleEndCall = () => navigate('/agent/wrap-up');
   const handleLogout = () => navigate('/login');
   const handleReturnToHome = () => navigate('/agent/home');
   
   const handleHotHandoff = () => {
-    setToast({ msg: "HOT HANDOFF INITIATED. Syncing context with Supervisor...", type: 'critical' });
-    setTimeout(() => handleEndCall(), 2000);
+    if (!activeCall) {
+      return;
+    }
+
+    escalateCall(activeCall.id, 'manual_supervisor_handoff')
+      .then(() => {
+        setToast({ msg: "HOT HANDOFF INITIATED. Syncing context with Supervisor...", type: 'critical' });
+        setTimeout(() => handleEndCall(), 2000);
+      })
+      .catch(() => {
+        setToast({ msg: 'Unable to escalate call. Backend unavailable.', type: 'warning' });
+      });
   };
 
   const handleApproveSummary = () => {
-    setToast({ msg: "Response verified. Broadcasting to citizen...", type: 'info' });
-    setIsSummaryReady(false);
-    setTranscript(prev => [...prev, { id: `a${Date.now()}`, speaker: 'agent', text: "Verified. I have recorded the pothole hazard at Silk Board Junction. Help is on the way." }]);
+    if (!activeCall) return;
+    
+    setToast({ msg: "Sending response to citizen...", type: 'info' });
+    sendAgentResponse(activeCall.id, summaryScript)
+      .then(() => {
+        setIsSummaryReady(false);
+        setTranscript(prev => [...prev, { id: `a${Date.now()}`, speaker: 'agent', text: summaryScript }]);
+        setToast({ msg: "Response delivered to citizen.", type: 'info' });
+      })
+      .catch(() => {
+        setToast({ msg: 'Failed to send response. Please try again.', type: 'warning' });
+      });
   };
 
   const handleQueueSwitch = (item: QueueItemData) => {
@@ -139,7 +325,7 @@ export default function Dashboard() {
     if (activeCall) setQueue(prev => [...prev, activeCall]);
     setActiveCall(item);
     setTimer(0);
-    setTranscript(MOCK_TRANSCRIPT_BASE);
+    setTranscript([]);
     setIsSummaryReady(false);
   };
 
@@ -337,6 +523,21 @@ export default function Dashboard() {
                           })}
                         </p>
                       ) : line.text}
+                      {/* Per-turn actions for citizen turns */}
+                      {line.speaker === 'citizen' && (
+                        <div className="absolute -right-8 top-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button
+                            onClick={() => {
+                              setCorrectionTurnId(line.id);
+                              setCorrectionText('');
+                              setIsCorrectionOpen(true);
+                            }}
+                            className="bg-brand-card border border-brand-border text-[10px] px-2 py-1 rounded-md hover:bg-brand-primary/10"
+                          >
+                            Correct Intent
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </motion.div>
                 ))}
@@ -455,31 +656,50 @@ export default function Dashboard() {
         {/* --- RIGHT SIDEBAR: Signals --- */}
         <aside className="w-80 bg-black border-l border-brand-border shrink-0 flex flex-col p-8 space-y-10 overflow-y-auto scrollbar-hide relative">
           <div className="space-y-8">
-            {/* Tone Detected */}
-            <div className="flex items-start justify-between">
-              <div className="flex items-center gap-4">
-                <Activity size={20} className="text-gray-600" />
-                <div>
-                  <p className="text-[8px] font-black text-gray-600 uppercase tracking-widest mb-0.5">Tone Detected</p>
-                  <p className="text-sm font-bold text-white tracking-wide">Distressed</p>
+            {/* Tone Detected - Clickable */}
+            <button onClick={() => setIsSignalDetailOpen(true)} className="w-full text-left hover:opacity-80 transition-opacity">
+              <div className="flex items-start justify-between">
+                <div className="flex items-center gap-4">
+                  <Activity size={20} className="text-gray-600" />
+                  <div>
+                    <p className="text-[8px] font-black text-gray-600 uppercase tracking-widest mb-0.5">Tone Detected</p>
+                    <p className="text-sm font-bold text-white tracking-wide">{signals.emotion}</p>
+                  </div>
                 </div>
+                <div className={cn(
+                  "w-1.5 h-1.5 rounded-full mt-2 shadow-lg",
+                  signals.emotion === 'Panicked' ? 'bg-brand-danger shadow-[0_0_8px_rgba(239,68,68,0.8)]' :
+                  signals.emotion === 'Distressed' ? 'bg-brand-danger shadow-[0_0_8px_rgba(239,68,68,0.6)]' :
+                  signals.emotion === 'Anxious' ? 'bg-brand-warning shadow-[0_0_8px_rgba(217,119,6,0.6)]' :
+                  signals.emotion === 'Confused' ? 'bg-brand-primary shadow-[0_0_8px_rgba(59,130,246,0.6)]' :
+                  'bg-brand-success shadow-[0_0_8px_rgba(16,185,129,0.6)]'
+                )} />
               </div>
-              <div className="w-1.5 h-1.5 rounded-full bg-brand-danger shadow-[0_0_8px_rgba(239,68,68,0.8)] mt-2" />
-            </div>
+            </button>
 
             {/* Speech Rate */}
             <div className="flex items-center gap-4">
               <Volume2 size={20} className="text-gray-600" />
               <div>
                 <p className="text-[8px] font-black text-gray-600 uppercase tracking-widest mb-0.5">Speech Rate</p>
-                <p className="text-sm font-bold text-white tracking-wide">145 WPM (Fast)</p>
+                <p className="text-sm font-bold text-white tracking-wide">{signals.wpm} WPM ({signals.speechRate})</p>
               </div>
             </div>
-          </div>
 
-          <Divider className="opacity-20" />
+            {/* Intent - Clickable */}
+            {signals.intent && (
+              <button onClick={() => setIsSignalDetailOpen(true)} className="w-full text-left hover:opacity-80 transition-opacity">
+                <div className="flex items-center gap-4">
+                  <AlertCircle size={20} className="text-gray-600" />
+                  <div>
+                    <p className="text-[8px] font-black text-gray-600 uppercase tracking-widest mb-0.5">Caller Intent</p>
+                    <p className="text-sm font-bold text-white tracking-wide">{signals.intent}</p>
+                  </div>
+                </div>
+              </button>
+            )}
 
-          <div className="space-y-6">
+            {/* ML Confidence */}
             <div className="flex items-center justify-between">
               <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-500">ML Confidence</h3>
               <div className={cn(
@@ -499,6 +719,143 @@ export default function Dashboard() {
           </div>
 
           <Divider className="opacity-20" />
+
+          {/* Correction Modal */}
+          <AnimatePresence>
+            {isCorrectionOpen && (
+              <>
+                <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 bg-black/60" onClick={() => setIsCorrectionOpen(false)} />
+                <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }} className="fixed z-60 left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-96 bg-black border border-brand-border rounded-lg p-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <h4 className="text-[10px] font-black uppercase tracking-widest text-brand-primary">Correct Intent</h4>
+                    <IconButton onClick={() => setIsCorrectionOpen(false)}><X size={14} /></IconButton>
+                  </div>
+                  <div className="space-y-3">
+                    <p className="text-sm text-gray-400">Turn ID: {correctionTurnId}</p>
+                    <EditableTextField value={correctionText} isEditing={true} multiline onChange={(v) => setCorrectionText(v)} className="text-white" />
+                    <div className="flex justify-end gap-2">
+                      <GhostButton onClick={() => setIsCorrectionOpen(false)}>Cancel</GhostButton>
+                      <PrimaryButton onClick={async () => {
+                        if (!activeCall || !correctionTurnId) return;
+                        try {
+                          await (await import('../lib/backend')).correctIntent(activeCall.id, correctionTurnId, { intent: correctionText });
+                          setToast({ msg: 'Intent correction saved.', type: 'info' });
+                          setIsCorrectionOpen(false);
+                        } catch (e) {
+                          setToast({ msg: 'Failed to save correction.', type: 'warning' });
+                        }
+                      }}>Save</PrimaryButton>
+                    </div>
+                  </div>
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
+
+          {/* Signal Detail Modal */}
+          <AnimatePresence>
+            {isSignalDetailOpen && (
+              <>
+                <motion.div 
+                  initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                  className="fixed inset-0 z-[100] bg-black/60 backdrop-blur-sm" 
+                  onClick={() => setIsSignalDetailOpen(false)}
+                />
+                <motion.div
+                  initial={{ opacity: 0, x: 20, scale: 0.95 }}
+                  animate={{ opacity: 1, x: 0, scale: 1 }}
+                  exit={{ opacity: 0, x: 20, scale: 0.95 }}
+                  className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-96 bg-black border border-brand-border rounded-lg shadow-2xl z-[110] p-6 max-h-[80vh] overflow-y-auto scrollbar-hide"
+                >
+                  <div className="flex items-center justify-between mb-6">
+                    <h4 className="text-[10px] font-black uppercase tracking-widest text-brand-primary">Signal Breakdown</h4>
+                    <IconButton onClick={() => setIsSignalDetailOpen(false)}>
+                      <X size={14} />
+                    </IconButton>
+                  </div>
+                  <div className="space-y-6">
+                    {/* Emotion Breakdown */}
+                    <div>
+                      <p className="text-[9px] font-black text-gray-600 uppercase mb-3 tracking-widest">Emotional State</p>
+                      <div className="space-y-2 ml-2">
+                        <div className="flex items-center justify-between">
+                          <p className="text-xs text-gray-400">Detected Emotion:</p>
+                          <p className="text-xs font-bold text-white">{signals.emotion}</p>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <p className="text-xs text-gray-400">Stress Intensity:</p>
+                          <p className="text-xs font-bold text-white">{signals.stressIntensity}/5 ({getStressLabel(signals.stressIntensity)})</p>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <p className="text-xs text-gray-400">Stress Score:</p>
+                          <p className="text-xs font-bold text-white">{(signals.stressScore ?? 0).toFixed(2)}</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Acoustic Features */}
+                    {signals.acousticFeatures && (
+                      <div>
+                        <p className="text-[9px] font-black text-gray-600 uppercase mb-3 tracking-widest">Acoustic Indicators</p>
+                        <div className="space-y-2 ml-2">
+                          {signals.acousticFeatures.rms !== undefined && (
+                            <div className="flex items-center justify-between">
+                              <p className="text-xs text-gray-400">Volume (RMS):</p>
+                              <p className="text-xs font-bold text-white">{getAcousticLabel(signals.acousticFeatures.rms)}</p>
+                            </div>
+                          )}
+                          {signals.acousticFeatures.zcr !== undefined && (
+                            <div className="flex items-center justify-between">
+                              <p className="text-xs text-gray-400">Clarity (ZCR):</p>
+                              <p className="text-xs font-bold text-white">{(signals.acousticFeatures.zcr * 100).toFixed(1)}%</p>
+                            </div>
+                          )}
+                          {signals.acousticFeatures.centroid !== undefined && (
+                            <div className="flex items-center justify-between">
+                              <p className="text-xs text-gray-400">Pitch Centroid:</p>
+                              <p className="text-xs font-bold text-white">{Math.round(signals.acousticFeatures.centroid)} Hz</p>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Intent Breakdown */}
+                    {signals.intent && (
+                      <div>
+                        <p className="text-[9px] font-black text-gray-600 uppercase mb-3 tracking-widest">Caller Intent</p>
+                        <div className="space-y-2 ml-2">
+                          <div className="flex items-center justify-between">
+                            <p className="text-xs text-gray-400">Detected Intent:</p>
+                            <p className="text-xs font-bold text-white">{signals.intent}</p>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <p className="text-xs text-gray-400">Confidence:</p>
+                            <p className="text-xs font-bold text-white">{Math.round((signals.intentConfidence ?? 0) * 100)}%</p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Speech Pattern */}
+                    <div>
+                      <p className="text-[9px] font-black text-gray-600 uppercase mb-3 tracking-widest">Speech Pattern</p>
+                      <div className="space-y-2 ml-2">
+                        <div className="flex items-center justify-between">
+                          <p className="text-xs text-gray-400">Words Per Minute:</p>
+                          <p className="text-xs font-bold text-white">{signals.wpm} WPM</p>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <p className="text-xs text-gray-400">Speech Rate:</p>
+                          <p className="text-xs font-bold text-white">{signals.speechRate}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              </>
+            )}
+          </AnimatePresence>
 
           {/* Live Understanding (Moved from bottom) */}
           <div className="space-y-6 flex-1 min-h-0 flex flex-col">

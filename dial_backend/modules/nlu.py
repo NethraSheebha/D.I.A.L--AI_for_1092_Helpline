@@ -282,6 +282,81 @@ Respond with ONLY this JSON object. No explanation. No markdown. No backticks:
         return {**fallback, "issue": kw_intent, "confidence": kw_conf}
 
 
+async def generate_agent_response(
+    transcript: str,
+    intent: dict,
+    sentiment: dict,
+    language: str = "en"
+) -> str:
+    """
+    Generate a professional AI response to the citizen's complaint.
+    
+    Args:
+        transcript: The citizen's original complaint text
+        intent: Intent detection result with 'issue', 'confidence', 'location', 'urgency'
+        sentiment: Sentiment analysis result with 'label', 'ipl', 'stress_score'
+        language: Language code (default: 'en')
+    
+    Returns:
+        str: Generated response text
+    """
+    if gemini_client is None:
+        return "Thank you for reporting this issue. Your complaint has been recorded."
+    
+    issue = intent.get("issue", "issue")
+    location = intent.get("location", "the reported location")
+    urgency = intent.get("urgency", "medium")
+    emotion = sentiment.get("label", "neutral").lower()
+    stress = sentiment.get("ipl", 3)
+    
+    # Build context-aware prompt
+    tone = "empathetic and supportive" if emotion in ["distressed", "panicked"] else "professional and helpful"
+    priority = "urgent attention" if urgency == "high" else "standard processing"
+    
+    prompt = f"""You are a professional civic helpline assistant. Generate a SHORT, empathetic response to this citizen complaint.
+
+**Citizen's Issue:** {transcript}
+**Detected Category:** {issue}
+**Location:** {location}
+**Urgency Level:** {urgency} ({priority})
+**Citizen's Emotional State:** {emotion} (stress level: {stress}/5)
+
+Generate a response that:
+1. Acknowledges their issue and shows empathy
+2. Confirms the details you understood
+3. Assures them action will be taken
+4. Keeps it under 2 sentences (for phone readout)
+5. Uses a {tone} tone
+
+Respond with ONLY the response text. No explanations, no quotes, no extra formatting."""
+
+    try:
+        def _call_gemini_response():
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=prompt
+            )
+            return response.text.strip()
+        
+        loop = asyncio.get_event_loop()
+        response_text = await asyncio.wait_for(
+            loop.run_in_executor(None, _call_gemini_response),
+            timeout=GEMINI_TIMEOUT
+        )
+        
+        # Clean response
+        response_text = response_text.strip('"\'`')
+        print(f"[NLU] Generated response: {response_text[:100]}")
+        return response_text if response_text else "Thank you for reporting this issue. Your complaint has been recorded."
+    
+    except asyncio.TimeoutError:
+        print(f"[NLU] Response generation timeout")
+        return f"Thank you for reporting a {issue}. Help is on the way."
+    except Exception as e:
+        print(f"[NLU] Response generation error: {type(e).__name__}: {e}")
+        return "Thank you for reporting this issue. Your complaint has been recorded."
+
+
 # --- Backward-compatible class wrappers --------------------------------------
 # main.py currently imports these classes. They delegate to the module-level
 # functions above so the existing code doesn't break.

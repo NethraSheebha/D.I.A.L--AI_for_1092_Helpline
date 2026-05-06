@@ -25,6 +25,15 @@ import {
   Divider
 } from '../components/Shared';
 import { cn } from '../lib/utils';
+import { fetchDashboardSummary, fetchCallHistory, fetchRecentCalls } from '../lib/backend';
+
+type CallSummary = {
+  call_id: string;
+  started_at?: string;
+  total_turns?: number;
+  outcome?: string;
+  last_transcript?: string;
+};
 
 export default function WrapUp() {
   const navigate = useNavigate();
@@ -32,12 +41,48 @@ export default function WrapUp() {
   const [timer, setTimer] = React.useState(30);
   const [correctionCategory, setCorrectionCategory] = React.useState('none');
   const [toast, setToast] = React.useState<string | null>(null);
+  const [sessionSummary, setSessionSummary] = React.useState<any | null>(null);
+  const [callHistory, setCallHistory] = React.useState<any[] | null>(null);
+  const [activeCall, setActiveCall] = React.useState<CallSummary | null>(null);
 
   React.useEffect(() => {
     const tick = setInterval(() => {
       setTimer(t => (t > 0 ? t - 1 : 0));
     }, 1000);
     return () => clearInterval(tick);
+  }, []);
+
+  React.useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const recent = await fetchRecentCalls();
+        if (!mounted) return;
+        if (recent.length > 0) {
+          const top = recent[0];
+          setActiveCall({ call_id: top.id, started_at: undefined, total_turns: 0, outcome: top.urgency, last_transcript: '' });
+          try {
+            const history = await fetchCallHistory(top.id);
+            if (!mounted) return;
+            setCallHistory(history.interactions || []);
+          } catch (e) {
+            // ignore
+          }
+        }
+
+        try {
+          const summary = await fetchDashboardSummary();
+          if (!mounted) return;
+          setSessionSummary(summary);
+        } catch (e) {
+          // ignore
+        }
+      } catch (e) {
+        // keep defaults
+      }
+    })();
+
+    return () => { mounted = false; };
   }, []);
 
   const handleManualRedeploy = () => {
@@ -71,7 +116,7 @@ export default function WrapUp() {
              </div>
              <div>
                 <h1 className="text-3xl font-display font-black text-white">Post-Call Audit</h1>
-                <div className="text-[10px] font-mono text-gray-500 uppercase tracking-widest font-bold">SESSION ARCHIVE: SESSION-9912-A-KAR</div>
+                <div className="text-[10px] font-mono text-gray-500 uppercase tracking-widest font-bold">{activeCall ? `SESSION: ${activeCall.call_id.slice(0,8).toUpperCase()}` : 'SESSION: N/A'}</div>
              </div>
           </div>
 
@@ -83,21 +128,21 @@ export default function WrapUp() {
                     <div className="p-2 bg-brand-primary/10 rounded-lg text-brand-primary">
                       <MessageSquare size={16} />
                     </div>
-                    <span className="text-sm font-bold text-white uppercase tracking-tight">Public Asset Damage (Road)</span>
+                    <span className="text-sm font-bold text-white uppercase tracking-tight">{callHistory && callHistory.length > 0 ? ((callHistory[callHistory.length-1].intent && (callHistory[callHistory.length-1].intent.intent || callHistory[callHistory.length-1].intent)) || 'Unknown') : 'Unknown'}</span>
                  </div>
                </div>
                <div className="space-y-2">
                  <div className="text-[9px] uppercase font-black text-gray-600 tracking-[0.2em]">Dialect Accuracy</div>
-                 <div className="flex items-center gap-2">
-                    <LanguageBadge language="Kannada" dialect="Dharwad" />
-                    <div className="px-2 py-1 bg-brand-success/10 text-brand-success text-[10px] font-black rounded border border-brand-success/20 uppercase tracking-tighter">94% Confidence</div>
-                 </div>
+                  <div className="flex items-center gap-2">
+                    <LanguageBadge language={callHistory && callHistory.length > 0 ? (callHistory[0].detected_lang || 'Detect') : 'Detect'} dialect={callHistory && callHistory.length > 0 ? (callHistory[0].dialect || 'Regional') : 'Regional'} />
+                    <div className="px-2 py-1 bg-brand-success/10 text-brand-success text-[10px] font-black rounded border border-brand-success/20 uppercase tracking-tighter">{sessionSummary ? `${Math.round(((sessionSummary.resolved||0) / Math.max(1, sessionSummary.total_calls||1)) * 100)}% Resolution` : 'N/A'}</div>
+                  </div>
                </div>
                <div className="sm:col-span-2 space-y-2">
                  <div className="text-[9px] uppercase font-black text-gray-600 tracking-[0.2em]">Verified Resolution Log</div>
                  <div className="p-4 bg-black/40 border border-brand-border rounded-xl">
                    <p className="text-sm text-gray-300 italic leading-relaxed font-medium">
-                     "Citizen reported severe road hazard at Silk Board Junction. Pothole depth estimated Level 4. Geotag verified. AI summary accepted by user. Department notified."
+                     {callHistory && callHistory.length > 0 ? (callHistory.map(c => c.transcript).join(' \n') ) : 'No call history available.'}
                    </p>
                  </div>
                </div>
