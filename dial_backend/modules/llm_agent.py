@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import os
 import re
 from dataclasses import dataclass, field
 from queue import Queue
@@ -18,9 +17,9 @@ load_dotenv()
 
 router = APIRouter()
 
-# Initialize STT and TTS models
-stt_model = IndicConformerSTT()
-tts_model = IndicParlerTTS()
+# Initialize models lazily
+stt_model = None
+tts_model = None
 
 
 @dataclass
@@ -50,12 +49,20 @@ class Gemma4Agent:
         self.device = device
         self.max_new_tokens = max_new_tokens
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
-        if device != -1 and torch.cuda.is_available():
-            self.model = self.model.to(device)
+        # Lazy loading placeholders
+        self.tokenizer = None
+        self.model = None
 
         self.state = ConversationState()
+
+    def _ensure_local_model(self):
+        """Lazy load the local model if needed as a fallback."""
+        if self.model is None:
+            print(f"[LLM] Loading local fallback model: {self.model_name}...")
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
+            self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+            if self.device != -1 and torch.cuda.is_available():
+                self.model = self.model.to(self.device)
 
     def stream_response(self, user_text: str) -> Generator[str, None, None]:
         """Generate a token stream for the next agent response."""
@@ -68,10 +75,10 @@ class Gemma4Agent:
                 model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite"),
                 contents=prompt
             )
-            # Simulate streaming or yield the whole text
-            yield response.text[cite: 2]
-        except google.api_core.exceptions.ServiceUnavailable, Exception as e:
+            yield response.text
+        except Exception as e:
             print(f"Gemini failed: {e}. Switching to local Gemma fallback.")
+            self._ensure_local_model()
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
             if self.device != -1 and torch.cuda.is_available():
                 input_ids = input_ids.to(self.device)

@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: dial_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dial_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - dial_pgdata:/var/lib/postgresql/data
+      - ./dial_backend/sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+  redis:
+    image: redis:7-alpine
+    container_name: dial_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+volumes:
+  dial_pgdata:

@@ -101,7 +101,7 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 export async function fetchRecentCalls(): Promise<QueueItemData[]> {
-  const payload = await getJson<RecentCallsResponse>('/agent/calls/recent');
+  const payload = await getJson<RecentCallsResponse>('/api/agent/calls/recent');
 
   return payload.calls.map((call) => ({
     id: call.call_id,
@@ -114,11 +114,11 @@ export async function fetchRecentCalls(): Promise<QueueItemData[]> {
 }
 
 export async function fetchAgentStats(): Promise<AgentStatsResponse> {
-  return getJson<AgentStatsResponse>('/agent/stats');
+  return getJson<AgentStatsResponse>('/api/agent/stats');
 }
 
 export async function fetchCallContext(callId: string): Promise<CallContextResponse> {
-  return getJson<CallContextResponse>(`/agent/call/${encodeURIComponent(callId)}`);
+  return getJson<CallContextResponse>(`/api/agent/call/${encodeURIComponent(callId)}`);
 }
 
 export interface DashboardSummaryResponse {
@@ -182,7 +182,7 @@ export function subscribeAgentUpdates(
 }
 
 export async function escalateCall(callId: string, reason: string): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/agent/call/${encodeURIComponent(callId)}/escalate`, {
+  const response = await fetch(`${API_BASE_URL}/api/agent/call/${encodeURIComponent(callId)}/escalate`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({ reason }),
@@ -194,7 +194,7 @@ export async function escalateCall(callId: string, reason: string): Promise<void
 }
 
 export async function sendAgentResponse(callId: string, responseText: string): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/agent/call/${encodeURIComponent(callId)}/response`, {
+  const response = await fetch(`${API_BASE_URL}/api/agent/call/${encodeURIComponent(callId)}/response`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({ response: responseText }),
@@ -206,7 +206,7 @@ export async function sendAgentResponse(callId: string, responseText: string): P
 }
 
 export async function correctIntent(callId: string, turnId: string, correctedIntent: Record<string, unknown>): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/agent/call/${encodeURIComponent(callId)}/intent`, {
+  const response = await fetch(`${API_BASE_URL}/api/agent/call/${encodeURIComponent(callId)}/intent`, {
     method: 'PATCH',
     headers: getAuthHeaders(),
     body: JSON.stringify({ turn_id: turnId, corrected_intent: correctedIntent }),

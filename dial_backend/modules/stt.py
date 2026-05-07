@@ -12,18 +12,22 @@ class IndicConformerSTT:
     """Incremental STT wrapper using Indic-Conformer."""
     def __init__(
         self,
-        model_name: str = "ai4bharat/indic-conformer-600m-multilingual",
+        model_name: str = "openai/whisper-tiny",
         device: str = "cpu",
         sample_rate: int = 16000,
     ) -> None:
         self.model_name = model_name
         self.device = device
         self.sample_rate = sample_rate
-        self.pipeline = pipeline(
-            task="automatic-speech-recognition",
-            model=self.model_name,
-            device=0 if self.device == "cuda" else -1,
-        )
+        try:
+            self.pipeline = pipeline(
+                task="automatic-speech-recognition",
+                model=self.model_name,
+                device=0 if self.device == "cuda" else -1,
+            )
+        except Exception as e:
+            print(f"[STT] Error: Could not load local STT model '{model_name}': {e}")
+            self.pipeline = None
         self.buffer = np.zeros(0, dtype=np.int16)
         self.partial_transcript = ""
         self.final_transcripts: list[str] = []
@@ -55,6 +59,8 @@ class IndicConformerSTT:
         return final_text
 
     def _decode(self, samples: np.ndarray) -> str:
+        if self.pipeline is None:
+            return self.partial_transcript
         waveform = samples.astype(np.float32) / 32768.0
         try:
             output = self.pipeline(waveform)

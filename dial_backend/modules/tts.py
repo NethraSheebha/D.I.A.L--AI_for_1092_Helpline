@@ -70,11 +70,21 @@ class IndicParlerTTS:
         self.model_name = model_name
         self.sample_rate = sample_rate
         self.device = device
-        self.pipeline = pipeline(
-            task="text-to-speech",
-            model=self.model_name,
-            device=self.device,
-        )
+        try:
+            if model_name != "fallback":
+                # Ensure we don't crash if the model is gated/restricted
+                self.pipeline = pipeline(
+                    task="text-to-speech",
+                    model=self.model_name,
+                    device=self.device,
+                    trust_remote_code=True
+                )
+            else:
+                self.pipeline = None
+        except Exception as e:
+            print(f"[TTS] Warning: Could not load local TTS model '{model_name}': {e}")
+            print("[TTS] Continuing with Edge-TTS fallback.")
+            self.pipeline = None
         self.buffer = ""
 
     def enqueue_text(self, text: str, continue_flag: bool = True) -> List[bytes]:
@@ -100,20 +110,44 @@ class IndicParlerTTS:
         self.buffer = ""
         return self.synthesize(segment, continue_flag=continue_flag)
 
-    def synthesize(self, text_chunk: str, continue_flag: bool = True) -> bytes:
-        """Convert a textual segment into raw PCM audio bytes."""
-        output = self.pipeline(text_chunk)
-        audio = output["audio"] if isinstance(output, dict) else output
+    async def synthesize(self, text_chunk: str, language: str = "en") -> bytes:
+        """Convert a textual segment into raw PCM audio bytes with Edge-TTS fallback."""
+        try:
+            # Try the IndicParler local model first if pipeline is loaded
+            if hasattr(self, 'pipeline') and self.pipeline is not None:
+                output = self.pipeline(text_chunk)
+                audio = output["audio"] if isinstance(output, dict) else output
+                audio_array = audio.array if hasattr(audio, "array") else audio
+                return self._float32_to_int16(audio_array).tobytes()
+        except Exception as e:
+            print(f"[TTS] Local model failed/gated: {e}. Falling back to Edge-TTS.")
 
-        if hasattr(audio, "array"):
-            audio_array = audio.array
-        elif isinstance(audio, np.ndarray):
-            audio_array = audio
-        else:
-            raise RuntimeError("Unexpected audio output format from TTS pipeline")
-
-        pcm_int16 = self._float32_to_int16(audio_array)
-        return pcm_int16.tobytes()
+        # Fallback to Edge-TTS
+        if edge_tts:
+            voice = VOICE_MAP.get(language, DEFAULT_VOICE)
+            communicate = edge_tts.Communicate(text_chunk, voice)
+            
+            # Write to a buffer to avoid disk I/O
+            audio_data = b""
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_data += chunk["data"]
+            
+            if audio_data:
+                # Edge-TTS returns MP3/Opus usually, we need to convert to PCM 16kHz Mono
+                # For the demo, we'll try to return the bytes as is if the client can handle them,
+                # but main.py expects PCM. Let's use pydub to convert if available.
+                try:
+                    from pydub import AudioSegment
+                    import io
+                    song = AudioSegment.from_file(io.BytesIO(audio_data), format="mp3")
+                    song = song.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+                    return song.raw_data
+                except Exception as ex:
+                    print(f"[TTS] Pydub conversion failed: {ex}. Returning raw MP3.")
+                    return audio_data
+        
+        return b""
 
     def _float32_to_int16(self, audio: np.ndarray) -> np.ndarray:
         clipped = np.clip(audio, -1.0, 1.0)
@@ -122,5 +156,15 @@ class IndicParlerTTS:
 
 # Global initialization function called by FastAPI lifespan
 async def initialize_tts():
-    print("[TTS] Initializing Indic-Parler model...")
-    return IndicParlerTTS()
+    print("[TTS] Initializing TTS system...")
+    try:
+        return IndicParlerTTS()
+    except Exception as e:
+        print(f"[TTS] IndicParlerTTS init failed: {e}. Using Edge-TTS fallback only.")
+        # Return a dummy object that still has the synthesize method
+        class FallbackTTS:
+            async def synthesize(self, text, language="en"):
+                # We'll just call the static method logic or similar
+                # For now, let's just make IndicParlerTTS robust to init failure
+                pass
+        return IndicParlerTTS(model_name="fallback")

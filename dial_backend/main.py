@@ -9,7 +9,7 @@ import numpy as np
 import logging
 import time
 
-from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, APIRouter, status
+from fastapi import FastAPI, WebSocket, HTTPException, WebSocketDisconnect, APIRouter, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
@@ -27,6 +27,7 @@ from modules.tts import IndicParlerTTS, initialize_tts
 from modules.confidence import ConfidenceScorer
 from modules.llm_agent import Gemma4Agent
 import modules.store as store
+from services.call_simulator import start_simulation
 
 load_dotenv()
 
@@ -266,7 +267,6 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -443,9 +443,72 @@ async def get_dashboard_summary(
     }
 
 
-@app.post("/api/interaction/{interaction_id}/resolve")
-async def resolve_interaction(interaction_id: int, resolution: dict):
-    return {"status": "resolved", "interaction_id": interaction_id}
+@app.get("/api/call/{call_id}/recording")
+async def get_call_recording(call_id: str):
+    """
+    Returns the audio recording for a call.
+    In production: serve from S3/Storage.
+    For demo: check local recordings directory.
+    """
+    rec_path = f"recordings/{call_id}.wav"
+    if os.path.exists(rec_path):
+        from fastapi.responses import FileResponse
+        return FileResponse(rec_path)
+    raise HTTPException(status_code=404, detail="Recording not found")
+
+
+@app.get("/api/call/{call_id}/summary")
+async def get_call_summary_api(call_id: str):
+    """
+    Returns a structured summary of the call.
+    """
+    context = await store.get_call_context(call_id)
+    if not context:
+        raise HTTPException(status_code=404, detail="Call not found")
+        
+    # Build a nice summary
+    turns = context.get("turns", [])
+    transcript = " ".join([t.get("transcript", "") for t in turns])
+    
+    return {
+        "call_id": call_id,
+        "summary": "AI generated summary based on call context.",
+        "transcript": transcript,
+        "turns": turns,
+        "metadata": {
+            "duration": "02:45",
+            "dialect": context.get("dialect", "unknown"),
+            "urgency": "high" if any(t.get("sentiment_raw", {}).get("ipl", 0) > 3 for t in turns) else "medium"
+        }
+    }
+
+
+@app.websocket("/ws/replay/{call_id}")
+async def replay_ws(websocket: WebSocket, call_id: str):
+    """
+    WebSocket for incident replay.
+    Synchronizes audio, transcript, and analytics.
+    """
+    await websocket.accept()
+    context = await store.get_call_context(call_id)
+    if not context:
+        await websocket.close(code=4004)
+        return
+
+    turns = context.get("turns", [])
+    
+    for turn in turns:
+        # Send transcript and analytics for this turn
+        await websocket.send_json({
+            "type": "replay_step",
+            "turn": turn,
+            "timestamp": turn.get("timestamp")
+        })
+        # Simulate timing or wait for client signal
+        await asyncio.sleep(1.0) 
+
+    await websocket.send_json({"type": "replay_complete"})
+    await websocket.close()
 
 
 @app.websocket("/ws/call")
@@ -457,6 +520,10 @@ async def call_ws(websocket: WebSocket):
     # Initialize per-session engines
     stt_engine = IndicConformerSTT(device="cpu")
     analytics_engine = AcousticAnalytics()
+    
+    # Recording setup
+    os.makedirs("recordings", exist_ok=True)
+    audio_file = open(f"recordings/{call_id}.raw", "wb")
     
     audio_buffer = bytearray()
     chunk_buffer = ChunkBuffer()
@@ -577,6 +644,9 @@ async def call_ws(websocket: WebSocket):
                     message = data["bytes"]
                     logger.debug(f"[{call_id}] Received audio data: {len(message)} bytes")
                     
+                    # Save to recording
+                    audio_file.write(message)
+                    
                     # --- BROADCAST SYSTEM (FAN-OUT) ---
                     # 1. Stream A: Incremental STT
                     partial_text = stt_engine.append_pcm(message)
@@ -585,12 +655,27 @@ async def call_ws(websocket: WebSocket):
                     vitals = analytics_engine.process_chunk(message)
                     
                     # 3. Push to Dashboard/Frontend immediately
-                    await websocket.send_json({
+                    payload = {
                         "type": "partial",
-                        "text": partial_text,
-                        "vitals": vitals
-                    })
+                        "partial_transcript": partial_text,
+                        "vitals": vitals,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await websocket.send_json(payload)
                     
+                    # 4. Forward Caller Audio to Agent Dashboard via Redis
+                    if redis_client:
+                        try:
+                            import base64
+                            audio_payload = {
+                                "type": "caller_audio",
+                                "call_id": call_id,
+                                "audio": base64.b64encode(message).decode('utf-8'),
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            await redis_client.publish(f"call_updates:{call_id}", json.dumps(audio_payload))
+                        except Exception as e:
+                            logger.warning(f"[{call_id}] Failed to publish caller_audio: {e}")
                     if redis_client:
                         await redis_client.publish(
                             f"call_vitals:{call_id}", 
@@ -624,6 +709,21 @@ async def call_ws(websocket: WebSocket):
 
         except WebSocketDisconnect:
             logger.info(f"[{call_id}] WebSocket disconnected gracefully")
+            audio_file.close()
+            # Convert raw PCM to WAV for easier playback
+            try:
+                import wave
+                with open(f"recordings/{call_id}.raw", "rb") as raw:
+                    pcm_data = raw.read()
+                with wave.open(f"recordings/{call_id}.wav", "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(16000)
+                    wav.writeframes(pcm_data)
+                os.remove(f"recordings/{call_id}.raw")
+            except Exception as e:
+                logger.error(f"[{call_id}] Failed to finalize recording: {e}")
+
             active_call_id = None  # Clear active call
             await redis_delete(f"session:{call_id}")
             # cleanup in-memory registry
@@ -735,11 +835,21 @@ async def process_turn(websocket: WebSocket, session: dict, transcript_text: str
     estimated_wpm = (word_count / 5.0) * 60 if word_count > 0 else 0.0
     
     # Generate AI response based on intent and sentiment
+    # LANGUAGE LOCK: Ensure AI responds in the session's detected language
+    session_lang = session.get("language")
+    if not session_lang or session_lang == "en":
+        # If no language is locked yet, use the detected language from this turn
+        # In production, STT or a separate classifier would set this.
+        # For now, we'll assume the 'detected_lang' from STT.
+        session["language"] = detected_lang
+        session_lang = detected_lang
+        logger.info(f"[{session['call_id']}] Language LOCKED to: {session_lang}")
+
     ai_response = await generate_agent_response(
         transcript=transcript_text,
         intent=intent,
         sentiment=sentiment_val,
-        language=session.get("language", "en")
+        language=session_lang
     )
     # Publish incremental AI chunks for live agent preview (simple sentence split)
     if redis_client and ai_response:
@@ -820,13 +930,36 @@ async def process_turn(websocket: WebSocket, session: dict, transcript_text: str
     ai_response = ""
     async for text_chunk in agent.stream_response(transcript_text):
         ai_response += text_chunk
-
-        try:
-            audio_chunk = await tts_engine.synthesize(text_chunk)
-            if audio_chunk:
-                await websocket.send_bytes(audio_chunk)
-        except Exception as e:
-            logger.error(f"Streaming TTS error: {e}")
+    
+    # 5. Synthesize AI response and send back to caller
+    try:
+        # First send the text response via WebSocket
+        await websocket.send_json({"type": "agent_message", "text": ai_response})
+        
+        # Then generate and stream audio chunks
+        # Note: We now publish these to Redis so the Dashboard can hear it too
+        audio_bytes = await tts_engine.synthesize(ai_response, language=session_lang)
+        if audio_bytes:
+            # Send to caller
+            await websocket.send_bytes(audio_bytes)
+            
+            # Forward AI Audio to Agent Dashboard via Redis
+            if redis_client:
+                import base64
+                # Split into chunks if it's too large for a single message
+                chunk_size = 8000
+                for i in range(0, len(audio_bytes), chunk_size):
+                    chunk = audio_bytes[i:i + chunk_size]
+                    ai_audio_payload = {
+                        "type": "ai_audio",
+                        "call_id": session["call_id"],
+                        "audio": base64.b64encode(chunk).decode('utf-8'),
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await redis_client.publish(f"call_updates:{session['call_id']}", json.dumps(ai_audio_payload))
+        
+    except Exception as e:
+        logger.error(f"[{session['call_id']}] TTS synthesis failed: {type(e).__name__}: {str(e)[:100]}")
     
     session["last_transcript"] = transcript_text
     session["last_intent"] = intent
@@ -1123,7 +1256,24 @@ async def get_statistics():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-app.include_router(agent_router)
+@agent_router.api_route("/simulate-call/{scenario}", methods=["GET", "POST"], status_code=202)
+async def trigger_call_simulation(scenario: str, background_tasks: BackgroundTasks):
+    """
+    Triggers a real-time call simulation for testing.
+    Scenarios: kannada_urban, kannada_rural, hindi_caller, english_caller
+    """
+    logger.info(f"Triggering simulation for scenario: {scenario}")
+    
+    # We run the simulation in the background so the API returns immediately
+    background_tasks.add_task(start_simulation, scenario)
+    
+    return {
+        "status": "simulation_started",
+        "scenario": scenario,
+        "message": f"Simulation for '{scenario}' is now running in the background."
+    }
+
+app.include_router(agent_router, prefix="/api")
 
 
 # Agent WebSocket endpoint for live call updates
@@ -1190,6 +1340,49 @@ async def websocket_agent_updates(websocket: WebSocket, call_id: str):
                 logger.info(f"Agent pub/sub cleaned up for call: {call_id}")
             except Exception as e:
                 logger.error(f"Error cleaning up pub/sub for {call_id}: {str(e)[:100]}")
+
+
+@app.websocket("/ws/agent/broadcast")
+async def websocket_agent_broadcast(websocket: WebSocket):
+    """Subscribe to ALL live call updates via Redis pub/sub pattern"""
+    await websocket.accept()
+    logger.info("Agent subscribed to GLOBAL broadcast")
+    
+    if not redis_client:
+        await websocket.send_json({"error": "Redis unavailable"})
+        await websocket.close()
+        return
+    
+    pubsub = None
+    try:
+        pubsub = redis_client.pubsub()
+        # Use psubscribe to listen to all call updates
+        await pubsub.psubscribe("call_updates:*")
+        
+        async for message in pubsub.listen():
+            if message["type"] == "pmessage":
+                try:
+                    # channel name: call_updates:uuid
+                    channel = message["channel"]
+                    if isinstance(channel, bytes):
+                        channel = channel.decode()
+                    
+                    call_id = channel.split(":")[-1]
+                    update = json.loads(message["data"])
+                    
+                    # Inject call_id into update for the frontend to know which call it belongs to
+                    update["call_id"] = call_id
+                    
+                    await websocket.send_json(update)
+                except Exception as e:
+                    logger.error(f"Broadcast error: {e}")
+    
+    except WebSocketDisconnect:
+        logger.info("Agent disconnected from global broadcast")
+    finally:
+        if pubsub:
+            await pubsub.punsubscribe("call_updates:*")
+            await pubsub.close()
 
 
 if __name__ == "__main__":

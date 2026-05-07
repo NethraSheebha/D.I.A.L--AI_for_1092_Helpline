@@ -10,6 +10,82 @@ import numpy as np
 import redis.asyncio as redis
 
 
+class AcousticAnalytics:
+    """
+    In-process acoustic analytics engine used by main.py.
+    Provides synchronous processing of audio chunks.
+    """
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+        self.window_size_samples = int(sample_rate * 0.5) # 500ms
+        self.buffer = np.zeros(0, dtype=np.float32)
+        
+        # Thresholds
+        self.VOLUME_RMS_HIGH = 0.8
+        self.VOLUME_RMS_LOW = 0.05
+        self.PITCH_SPIKE_THRESHOLD = 400
+        self.ZCR_NOISE_THRESHOLD = 0.15
+
+    async def initialize(self):
+        """Placeholder for any model loading if needed."""
+        print("[Analytics] AcousticAnalytics engine ready")
+        return self
+
+    def process_chunk(self, pcm_bytes: bytes) -> dict:
+        """
+        Processes a chunk of PCM bytes and returns vitals.
+        This matches the signature expected by main.py.
+        """
+        if not pcm_bytes:
+            return self._empty_vitals()
+
+        # Convert to float32
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        self.buffer = np.concatenate([self.buffer, samples])
+
+        # Keep last 500ms for analysis
+        if len(self.buffer) > self.window_size_samples:
+            analysis_audio = self.buffer[-self.window_size_samples:]
+            # We keep the buffer small to avoid memory leak, but large enough for windowing
+            self.buffer = self.buffer[-self.window_size_samples*2:] 
+        else:
+            analysis_audio = self.buffer
+
+        # Basic metrics
+        volume_rms = float(np.sqrt(np.mean(analysis_audio**2))) if len(analysis_audio) > 0 else 0.0
+        
+        # Simple Zero Crossing Rate
+        zcr = 0.0
+        if len(analysis_audio) > 1:
+            zcr = float(np.mean(np.abs(np.diff(np.sign(analysis_audio)))) / 2)
+
+        # Label determination
+        label = "GREEN"
+        reason = "Normal"
+        
+        if volume_rms > self.VOLUME_RMS_HIGH:
+            label = "RED"
+            reason = "High volume (screaming)"
+        elif volume_rms < self.VOLUME_RMS_LOW and len(analysis_audio) > 1000:
+            label = "YELLOW"
+            reason = "Low volume (mumbling)"
+        elif zcr > self.ZCR_NOISE_THRESHOLD:
+            label = "YELLOW"
+            reason = "High background noise"
+
+        return {
+            "label": label,
+            "reason": reason,
+            "metrics": {
+                "volume_rms": round(volume_rms, 3),
+                "zcr": round(zcr, 3),
+            }
+        }
+
+    def _empty_vitals(self) -> dict:
+        return {"label": "GREEN", "reason": "No data", "metrics": {"volume_rms": 0, "zcr": 0}}
+
+
 class AcousticAnalyticsWorker:
     """
     Real-time acoustic analytics worker for voice AI calls.
